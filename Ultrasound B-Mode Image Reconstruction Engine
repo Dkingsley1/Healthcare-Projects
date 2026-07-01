@@ -1,0 +1,505 @@
+#!/usr/bin/env python3
+"""
+Ultrasound B-Mode Image Reconstruction Engine
+
+This standalone portfolio script simulates raw ultrasound RF channel data from a
+linear probe, reconstructs a B-mode image with delay-and-sum beamforming, then
+applies envelope detection and log compression to create a displayable image.
+
+The model is intentionally educational and prototyping-oriented. It is not a
+certified diagnostic medical device.
+"""
+
+from __future__ import annotations
+
+import argparse
+import struct
+import zlib
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+
+
+@dataclass(frozen=True)
+class ArrayConfig:
+    """Physical parameters for a simplified linear ultrasound array."""
+
+    elements: int = 64
+    pitch_m: float = 0.00030
+    speed_of_sound_m_s: float = 1540.0
+    center_frequency_hz: float = 5_000_000.0
+    sample_rate_hz: float = 40_000_000.0
+    pulse_cycles: float = 4.0
+
+
+@dataclass(frozen=True)
+class ImagingConfig:
+    """Image grid and display parameters for B-mode reconstruction."""
+
+    lateral_extent_m: float = 0.040
+    min_depth_m: float = 0.006
+    max_depth_m: float = 0.065
+    image_width: int = 192
+    image_height: int = 256
+    dynamic_range_db: float = 60.0
+    tgc_db_per_cm: float = 0.8
+
+
+def make_element_positions(config: ArrayConfig) -> np.ndarray:
+    """Return centered x-positions for each array element in meters."""
+    element_ids = np.arange(config.elements, dtype=np.float64)
+    return (element_ids - (config.elements - 1) / 2.0) * config.pitch_m
+
+
+def make_gaussian_pulse(config: ArrayConfig) -> tuple[np.ndarray, np.ndarray]:
+    """Create a short Gaussian-modulated ultrasound transmit pulse."""
+    duration_s = config.pulse_cycles / config.center_frequency_hz
+    sample_count = max(9, int(np.ceil(duration_s * config.sample_rate_hz)))
+    if sample_count % 2 == 0:
+        sample_count += 1
+
+    pulse_t = (np.arange(sample_count) - sample_count // 2) / config.sample_rate_hz
+    sigma_s = duration_s / 6.0
+    envelope = np.exp(-0.5 * (pulse_t / sigma_s) ** 2)
+    carrier = np.cos(2.0 * np.pi * config.center_frequency_hz * pulse_t)
+    pulse = envelope * carrier
+    pulse /= np.max(np.abs(pulse)) + 1e-12
+    return pulse_t, pulse.astype(np.float32)
+
+
+def make_default_phantom(seed: int) -> np.ndarray:
+    """
+    Create a synthetic ultrasound phantom.
+
+    Columns are x position in meters, z depth in meters, and reflectivity. The
+    background scatterers create speckle, while the stronger points and dark
+    cyst-like region make the reconstruction easier to inspect visually.
+    """
+    rng = np.random.default_rng(seed)
+
+    background_count = 850
+    x = rng.uniform(-0.019, 0.019, background_count)
+    z = rng.uniform(0.008, 0.062, background_count)
+    reflectivity = rng.normal(0.0, 0.075, background_count)
+
+    cyst_x = 0.006
+    cyst_z = 0.038
+    cyst_radius = 0.0065
+    outside_cyst = (x - cyst_x) ** 2 + (z - cyst_z) ** 2 > cyst_radius**2
+
+    background = np.column_stack((x[outside_cyst], z[outside_cyst], reflectivity[outside_cyst]))
+
+    bright_targets = np.array(
+        [
+            [-0.012, 0.015, 1.00],
+            [0.000, 0.022, 0.85],
+            [0.011, 0.029, 0.75],
+            [-0.006, 0.043, 1.05],
+            [0.014, 0.055, 0.90],
+        ],
+        dtype=np.float64,
+    )
+
+    calibration_wire_x = np.linspace(-0.014, 0.014, 7)
+    calibration_wire_z = np.full_like(calibration_wire_x, 0.050)
+    calibration_wire_amp = np.full_like(calibration_wire_x, 0.45)
+    calibration_wire = np.column_stack((calibration_wire_x, calibration_wire_z, calibration_wire_amp))
+
+    return np.vstack((background, bright_targets, calibration_wire))
+
+
+def estimate_recording_duration_s(
+    scatterers: np.ndarray,
+    element_x_m: np.ndarray,
+    array_config: ArrayConfig,
+) -> float:
+    """Estimate enough receive time to contain the latest simulated echo."""
+    c = array_config.speed_of_sound_m_s
+    max_delay = 0.0
+    for scatter_x, scatter_z, _ in scatterers:
+        rx_distance = np.sqrt((scatter_x - element_x_m) ** 2 + scatter_z**2)
+        delays = scatter_z / c + rx_distance / c
+        max_delay = max(max_delay, float(np.max(delays)))
+
+    pulse_duration = array_config.pulse_cycles / array_config.center_frequency_hz
+    return max_delay + 3.0 * pulse_duration
+
+
+def simulate_rf_channel_data(
+    scatterers: np.ndarray,
+    element_x_m: np.ndarray,
+    array_config: ArrayConfig,
+    noise_level: float,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Simulate RF channel data for a plane-wave transmit and per-element receive.
+
+    The delay model is:
+        time = transmit_depth / c + receive_distance_to_element / c
+    """
+    rng = np.random.default_rng(seed + 1000)
+    c = array_config.speed_of_sound_m_s
+    _, pulse = make_gaussian_pulse(array_config)
+    half_pulse = len(pulse) // 2
+
+    duration_s = estimate_recording_duration_s(scatterers, element_x_m, array_config)
+    sample_count = int(np.ceil(duration_s * array_config.sample_rate_hz)) + len(pulse)
+    time_axis_s = np.arange(sample_count, dtype=np.float64) / array_config.sample_rate_hz
+    rf_data = np.zeros((len(element_x_m), sample_count), dtype=np.float32)
+
+    for scatter_x, scatter_z, reflectivity in scatterers:
+        transmit_time_s = scatter_z / c
+        for element_index, element_x in enumerate(element_x_m):
+            receive_distance_m = np.sqrt((scatter_x - element_x) ** 2 + scatter_z**2)
+            delay_s = transmit_time_s + receive_distance_m / c
+            center_sample = int(round(delay_s * array_config.sample_rate_hz))
+            start_sample = center_sample - half_pulse
+            end_sample = start_sample + len(pulse)
+
+            write_start = max(0, start_sample)
+            write_end = min(sample_count, end_sample)
+            if write_start >= write_end:
+                continue
+
+            pulse_start = write_start - start_sample
+            pulse_end = pulse_start + (write_end - write_start)
+
+            depth_attenuation = 1.0 / (1.0 + 22.0 * scatter_z)
+            aperture_weight = 1.0 / (1.0 + 70.0 * abs(scatter_x - element_x))
+            amplitude = reflectivity * depth_attenuation * aperture_weight
+            rf_data[element_index, write_start:write_end] += amplitude * pulse[pulse_start:pulse_end]
+
+    peak = float(np.max(np.abs(rf_data)) + 1e-12)
+    rf_data += rng.normal(0.0, noise_level * peak, rf_data.shape).astype(np.float32)
+    return time_axis_s, rf_data
+
+
+def delay_and_sum_beamform(
+    rf_data: np.ndarray,
+    element_x_m: np.ndarray,
+    x_grid_m: np.ndarray,
+    z_grid_m: np.ndarray,
+    array_config: ArrayConfig,
+) -> np.ndarray:
+    """Reconstruct an RF image using receive delay-and-sum beamforming."""
+    sample_rate = array_config.sample_rate_hz
+    c = array_config.speed_of_sound_m_s
+    element_count = len(element_x_m)
+    image = np.zeros((len(z_grid_m), len(x_grid_m)), dtype=np.float32)
+
+    apodization = np.hanning(element_count).astype(np.float64)
+    apodization /= np.sum(apodization) + 1e-12
+    element_ids = np.arange(element_count)[:, None]
+    last_valid_start = rf_data.shape[1] - 2
+
+    for row_index, depth_m in enumerate(z_grid_m):
+        transmit_time_s = depth_m / c
+        receive_distance_m = np.sqrt((x_grid_m[None, :] - element_x_m[:, None]) ** 2 + depth_m**2)
+        delays_s = transmit_time_s + receive_distance_m / c
+        sample_position = delays_s * sample_rate
+
+        sample_floor = np.floor(sample_position).astype(np.int64)
+        fraction = sample_position - sample_floor
+        valid = (sample_floor >= 0) & (sample_floor <= last_valid_start)
+
+        clipped_floor = np.clip(sample_floor, 0, last_valid_start)
+        sample_0 = rf_data[element_ids, clipped_floor]
+        sample_1 = rf_data[element_ids, clipped_floor + 1]
+        interpolated = (1.0 - fraction) * sample_0 + fraction * sample_1
+        interpolated[~valid] = 0.0
+
+        image[row_index, :] = np.sum(interpolated * apodization[:, None], axis=0)
+
+    return image
+
+
+def hilbert_envelope(signal: np.ndarray, axis: int = 0) -> np.ndarray:
+    """Compute an analytic-signal envelope using the FFT Hilbert transform."""
+    n = signal.shape[axis]
+    spectrum = np.fft.fft(signal, axis=axis)
+    multiplier = np.zeros(n, dtype=np.float64)
+
+    if n % 2 == 0:
+        multiplier[0] = 1.0
+        multiplier[n // 2] = 1.0
+        multiplier[1 : n // 2] = 2.0
+    else:
+        multiplier[0] = 1.0
+        multiplier[1 : (n + 1) // 2] = 2.0
+
+    reshape = [1] * signal.ndim
+    reshape[axis] = n
+    analytic = np.fft.ifft(spectrum * multiplier.reshape(reshape), axis=axis)
+    return np.abs(analytic).astype(np.float32)
+
+
+def envelope_to_log_bmode(
+    envelope: np.ndarray,
+    z_grid_m: np.ndarray,
+    imaging_config: ImagingConfig,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Apply time-gain compensation and log compression."""
+    depth_cm = z_grid_m[:, None] * 100.0
+    tgc_gain = 10.0 ** ((imaging_config.tgc_db_per_cm * depth_cm) / 20.0)
+    compensated = envelope * tgc_gain
+
+    normalized = compensated / (np.max(compensated) + 1e-12)
+    bmode_db = 20.0 * np.log10(normalized + 1e-12)
+    bmode_db = np.clip(bmode_db, -imaging_config.dynamic_range_db, 0.0)
+
+    grayscale = (255.0 * (bmode_db + imaging_config.dynamic_range_db) / imaging_config.dynamic_range_db)
+    return bmode_db.astype(np.float32), grayscale.astype(np.uint8)
+
+
+def write_grayscale_pgm(path: Path, image: np.ndarray) -> None:
+    """Write a dependency-free binary PGM grayscale image."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    height, width = image.shape
+    header = f"P5\n{width} {height}\n255\n".encode("ascii")
+    with path.open("wb") as file:
+        file.write(header)
+        file.write(np.ascontiguousarray(image).tobytes())
+
+
+def write_grayscale_png(path: Path, image: np.ndarray) -> None:
+    """Write a dependency-free 8-bit grayscale PNG image."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    height, width = image.shape
+
+    def png_chunk(chunk_type: bytes, data: bytes) -> bytes:
+        checksum = zlib.crc32(chunk_type + data) & 0xFFFFFFFF
+        return (
+            struct.pack(">I", len(data))
+            + chunk_type
+            + data
+            + struct.pack(">I", checksum)
+        )
+
+    rows = [b"\x00" + np.ascontiguousarray(row).tobytes() for row in image]
+    raw_scanlines = b"".join(rows)
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 0, 0, 0, 0)
+
+    with path.open("wb") as file:
+        file.write(b"\x89PNG\r\n\x1a\n")
+        file.write(png_chunk(b"IHDR", ihdr))
+        file.write(png_chunk(b"IDAT", zlib.compress(raw_scanlines, level=9)))
+        file.write(png_chunk(b"IEND", b""))
+
+
+def write_grayscale_bmp(path: Path, image: np.ndarray) -> None:
+    """Write a dependency-free 24-bit BMP image using grayscale RGB values."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    height, width = image.shape
+    row_stride = width * 3
+    padding = (4 - (row_stride % 4)) % 4
+    pixel_data_size = (row_stride + padding) * height
+    file_size = 54 + pixel_data_size
+
+    file_header = bytearray()
+    file_header.extend(b"BM")
+    file_header.extend(file_size.to_bytes(4, "little"))
+    file_header.extend((0).to_bytes(4, "little"))
+    file_header.extend((54).to_bytes(4, "little"))
+
+    dib_header = bytearray()
+    dib_header.extend((40).to_bytes(4, "little"))
+    dib_header.extend(width.to_bytes(4, "little", signed=True))
+    dib_header.extend(height.to_bytes(4, "little", signed=True))
+    dib_header.extend((1).to_bytes(2, "little"))
+    dib_header.extend((24).to_bytes(2, "little"))
+    dib_header.extend((0).to_bytes(4, "little"))
+    dib_header.extend(pixel_data_size.to_bytes(4, "little"))
+    dib_header.extend((2835).to_bytes(4, "little", signed=True))
+    dib_header.extend((2835).to_bytes(4, "little", signed=True))
+    dib_header.extend((0).to_bytes(4, "little"))
+    dib_header.extend((0).to_bytes(4, "little"))
+
+    with path.open("wb") as file:
+        file.write(file_header)
+        file.write(dib_header)
+        for row in image[::-1]:
+            rgb = np.repeat(row[:, None], 3, axis=1)
+            bgr = rgb[:, ::-1]
+            file.write(bgr.astype(np.uint8).tobytes())
+            file.write(b"\x00" * padding)
+
+
+def write_summary(
+    path: Path,
+    array_config: ArrayConfig,
+    imaging_config: ImagingConfig,
+    scatterer_count: int,
+    rf_shape: tuple[int, int],
+    outputs: dict[str, Path],
+) -> None:
+    """Write a concise reconstruction summary for portfolio review."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "Ultrasound B-Mode Image Reconstruction Engine",
+        "",
+        "Pipeline:",
+        "1. Simulated point-scatterer phantom.",
+        "2. Generated raw RF channel data for a linear probe.",
+        "3. Applied delay-and-sum beamforming on a 2D image grid.",
+        "4. Used FFT Hilbert envelope detection.",
+        "5. Applied time-gain compensation and log compression.",
+        "",
+        "Array parameters:",
+        f"- Elements: {array_config.elements}",
+        f"- Pitch: {array_config.pitch_m * 1e3:.3f} mm",
+        f"- Center frequency: {array_config.center_frequency_hz / 1e6:.2f} MHz",
+        f"- Sample rate: {array_config.sample_rate_hz / 1e6:.2f} MHz",
+        f"- Speed of sound: {array_config.speed_of_sound_m_s:.1f} m/s",
+        "",
+        "Image parameters:",
+        f"- Width x height: {imaging_config.image_width} x {imaging_config.image_height}",
+        f"- Lateral span: {imaging_config.lateral_extent_m * 1e3:.1f} mm",
+        f"- Depth range: {imaging_config.min_depth_m * 1e3:.1f} to {imaging_config.max_depth_m * 1e3:.1f} mm",
+        f"- Dynamic range: {imaging_config.dynamic_range_db:.1f} dB",
+        "",
+        "Data:",
+        f"- Scatterers: {scatterer_count}",
+        f"- RF channel matrix: {rf_shape[0]} elements x {rf_shape[1]} samples",
+        "",
+        "Outputs:",
+    ]
+
+    for label, output_path in outputs.items():
+        lines.append(f"- {label}: {output_path}")
+
+    lines.extend(
+        [
+            "",
+            "Important note:",
+            "This is a DSP and image-reconstruction prototype for portfolio use.",
+            "It is not a certified diagnostic ultrasound or medical device system.",
+        ]
+    )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Simulate ultrasound RF channel data and reconstruct a B-mode image with delay-and-sum beamforming."
+    )
+    parser.add_argument("--output-dir", default="outputs", help="Directory for reconstructed images and data files.")
+    parser.add_argument("--elements", type=int, default=64, help="Number of receive elements in the linear array.")
+    parser.add_argument("--pitch-mm", type=float, default=0.30, help="Element pitch in millimeters.")
+    parser.add_argument("--center-frequency-mhz", type=float, default=5.0, help="Ultrasound center frequency in MHz.")
+    parser.add_argument("--sample-rate-mhz", type=float, default=40.0, help="RF sample rate in MHz.")
+    parser.add_argument("--image-width", type=int, default=192, help="Number of lateral image pixels.")
+    parser.add_argument("--image-height", type=int, default=256, help="Number of depth image pixels.")
+    parser.add_argument("--lateral-mm", type=float, default=40.0, help="Total lateral field of view in millimeters.")
+    parser.add_argument("--min-depth-mm", type=float, default=6.0, help="Minimum imaging depth in millimeters.")
+    parser.add_argument("--max-depth-mm", type=float, default=65.0, help="Maximum imaging depth in millimeters.")
+    parser.add_argument("--dynamic-range-db", type=float, default=60.0, help="Displayed B-mode dynamic range in dB.")
+    parser.add_argument("--tgc-db-per-cm", type=float, default=0.8, help="Time-gain compensation in dB per cm.")
+    parser.add_argument("--noise-level", type=float, default=0.018, help="Gaussian RF noise level as a fraction of peak signal.")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for the synthetic phantom and noise.")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    array_config = ArrayConfig(
+        elements=args.elements,
+        pitch_m=args.pitch_mm / 1000.0,
+        center_frequency_hz=args.center_frequency_mhz * 1_000_000.0,
+        sample_rate_hz=args.sample_rate_mhz * 1_000_000.0,
+    )
+    imaging_config = ImagingConfig(
+        lateral_extent_m=args.lateral_mm / 1000.0,
+        min_depth_m=args.min_depth_mm / 1000.0,
+        max_depth_m=args.max_depth_mm / 1000.0,
+        image_width=args.image_width,
+        image_height=args.image_height,
+        dynamic_range_db=args.dynamic_range_db,
+        tgc_db_per_cm=args.tgc_db_per_cm,
+    )
+
+    element_x_m = make_element_positions(array_config)
+    scatterers = make_default_phantom(args.seed)
+    time_axis_s, rf_data = simulate_rf_channel_data(
+        scatterers=scatterers,
+        element_x_m=element_x_m,
+        array_config=array_config,
+        noise_level=args.noise_level,
+        seed=args.seed,
+    )
+
+    x_grid_m = np.linspace(
+        -imaging_config.lateral_extent_m / 2.0,
+        imaging_config.lateral_extent_m / 2.0,
+        imaging_config.image_width,
+    )
+    z_grid_m = np.linspace(
+        imaging_config.min_depth_m,
+        imaging_config.max_depth_m,
+        imaging_config.image_height,
+    )
+
+    beamformed_rf = delay_and_sum_beamform(
+        rf_data=rf_data,
+        element_x_m=element_x_m,
+        x_grid_m=x_grid_m,
+        z_grid_m=z_grid_m,
+        array_config=array_config,
+    )
+    envelope = hilbert_envelope(beamformed_rf, axis=0)
+    bmode_db, grayscale = envelope_to_log_bmode(envelope, z_grid_m, imaging_config)
+
+    png_path = output_dir / "bmode_reconstruction.png"
+    bmp_path = output_dir / "bmode_reconstruction.bmp"
+    pgm_path = output_dir / "bmode_reconstruction.pgm"
+    csv_path = output_dir / "bmode_image_db.csv"
+    npz_path = output_dir / "rf_channel_data_and_reconstruction.npz"
+    summary_path = output_dir / "reconstruction_summary.txt"
+
+    write_grayscale_png(png_path, grayscale)
+    write_grayscale_bmp(bmp_path, grayscale)
+    write_grayscale_pgm(pgm_path, grayscale)
+    np.savetxt(csv_path, bmode_db, delimiter=",", fmt="%.3f")
+    np.savez_compressed(
+        npz_path,
+        time_axis_s=time_axis_s,
+        rf_data=rf_data,
+        beamformed_rf=beamformed_rf,
+        envelope=envelope,
+        bmode_db=bmode_db,
+        grayscale=grayscale,
+        element_x_m=element_x_m,
+        x_grid_m=x_grid_m,
+        z_grid_m=z_grid_m,
+        scatterers=scatterers,
+    )
+
+    outputs = {
+        "B-mode PNG image": png_path,
+        "B-mode BMP image": bmp_path,
+        "B-mode PGM image": pgm_path,
+        "B-mode dB CSV": csv_path,
+        "RF and reconstruction NPZ": npz_path,
+    }
+    write_summary(
+        path=summary_path,
+        array_config=array_config,
+        imaging_config=imaging_config,
+        scatterer_count=len(scatterers),
+        rf_shape=rf_data.shape,
+        outputs=outputs,
+    )
+
+    print("Ultrasound B-mode reconstruction complete.")
+    print(f"PNG image: {png_path}")
+    print(f"BMP image: {bmp_path}")
+    print(f"PGM image: {pgm_path}")
+    print(f"Summary:   {summary_path}")
+
+
+if __name__ == "__main__":
+    main()
