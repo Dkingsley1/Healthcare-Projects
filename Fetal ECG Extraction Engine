@@ -1,0 +1,794 @@
+#!/usr/bin/env python3
+"""
+Fetal ECG Extraction Engine
+
+This portfolio prototype simulates a maternal abdominal ECG recording, then
+extracts the weaker fetal ECG using adaptive maternal cancellation and
+frequency-domain enhancement.
+
+The pipeline is for DSP demonstration and research prototyping. It is not a
+certified diagnostic medical device.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import struct
+import zlib
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+
+
+@dataclass(frozen=True)
+class SimulationConfig:
+    sample_rate_hz: float = 500.0
+    duration_s: float = 25.0
+    maternal_hr_bpm: float = 78.0
+    fetal_hr_bpm: float = 148.0
+    fetal_scale: float = 0.22
+    noise_level: float = 0.035
+    powerline_hz: float = 60.0
+    seed: int = 7
+
+
+@dataclass(frozen=True)
+class ExtractionConfig:
+    lms_taps: int = 36
+    lms_mu: float = 0.085
+    lms_leakage: float = 0.00001
+    fetal_band_low_hz: float = 5.0
+    fetal_band_high_hz: float = 65.0
+    qrs_window_ms: float = 70.0
+    fetal_min_bpm: float = 90.0
+    fetal_max_bpm: float = 220.0
+
+
+def gaussian(time_s: np.ndarray, center_s: float, width_s: float, amplitude: float) -> np.ndarray:
+    return amplitude * np.exp(-0.5 * ((time_s - center_s) / width_s) ** 2)
+
+
+def ecg_template(relative_time_s: np.ndarray, fetal: bool) -> np.ndarray:
+    """Create a synthetic PQRST beat shape."""
+    if fetal:
+        return (
+            gaussian(relative_time_s, -0.105, 0.020, 0.10)
+            + gaussian(relative_time_s, -0.018, 0.006, -0.22)
+            + gaussian(relative_time_s, 0.000, 0.008, 1.00)
+            + gaussian(relative_time_s, 0.022, 0.009, -0.34)
+            + gaussian(relative_time_s, 0.120, 0.035, 0.22)
+        )
+
+    return (
+        gaussian(relative_time_s, -0.180, 0.030, 0.14)
+        + gaussian(relative_time_s, -0.045, 0.010, -0.20)
+        + gaussian(relative_time_s, 0.000, 0.012, 1.00)
+        + gaussian(relative_time_s, 0.045, 0.014, -0.34)
+        + gaussian(relative_time_s, 0.260, 0.070, 0.32)
+    )
+
+
+def generate_beat_times(
+    heart_rate_bpm: float,
+    duration_s: float,
+    variability: float,
+    rng: np.random.Generator,
+    start_s: float,
+) -> np.ndarray:
+    """Generate beat times with mild heart-rate variability."""
+    beat_times: list[float] = []
+    base_interval_s = 60.0 / heart_rate_bpm
+    time_s = start_s
+
+    while time_s < duration_s - 0.25:
+        beat_times.append(time_s)
+        interval_s = base_interval_s * (1.0 + rng.normal(0.0, variability))
+        interval_s = float(np.clip(interval_s, 0.72 * base_interval_s, 1.28 * base_interval_s))
+        time_s += interval_s
+
+    return np.array(beat_times, dtype=np.float64)
+
+
+def synthesize_ecg(
+    time_axis_s: np.ndarray,
+    beat_times_s: np.ndarray,
+    fetal: bool,
+) -> np.ndarray:
+    """Synthesize an ECG waveform by placing PQRST templates at beat times."""
+    signal = np.zeros_like(time_axis_s, dtype=np.float64)
+    half_window_s = 0.24 if fetal else 0.42
+
+    for beat_s in beat_times_s:
+        start = np.searchsorted(time_axis_s, beat_s - half_window_s)
+        end = np.searchsorted(time_axis_s, beat_s + half_window_s)
+        if start >= end:
+            continue
+
+        local_time_s = time_axis_s[start:end] - beat_s
+        signal[start:end] += ecg_template(local_time_s, fetal=fetal)
+
+    signal /= np.max(np.abs(signal)) + 1e-12
+    return signal
+
+
+def maternal_body_path(maternal_ecg: np.ndarray) -> np.ndarray:
+    """Approximate the torso-to-abdominal transfer path with a short FIR model."""
+    path = np.zeros(34, dtype=np.float64)
+    path[1] = 0.96
+    path[5] = 0.25
+    path[12] = -0.13
+    path[20] = 0.07
+    path[28] = -0.035
+    return np.convolve(maternal_ecg, path, mode="full")[: len(maternal_ecg)]
+
+
+def simulate_abdominal_recording(config: SimulationConfig) -> dict[str, np.ndarray]:
+    """Create maternal reference, abdominal mixture, and true fetal reference."""
+    rng = np.random.default_rng(config.seed)
+    sample_count = int(round(config.duration_s * config.sample_rate_hz))
+    time_axis_s = np.arange(sample_count, dtype=np.float64) / config.sample_rate_hz
+
+    maternal_beats_s = generate_beat_times(
+        config.maternal_hr_bpm,
+        config.duration_s,
+        variability=0.035,
+        rng=rng,
+        start_s=0.62,
+    )
+    fetal_beats_s = generate_beat_times(
+        config.fetal_hr_bpm,
+        config.duration_s,
+        variability=0.030,
+        rng=rng,
+        start_s=0.48,
+    )
+
+    maternal_ecg = synthesize_ecg(time_axis_s, maternal_beats_s, fetal=False)
+    fetal_ecg = synthesize_ecg(time_axis_s, fetal_beats_s, fetal=True)
+    maternal_abdominal = maternal_body_path(maternal_ecg)
+
+    baseline = 0.12 * np.sin(2.0 * np.pi * 0.25 * time_axis_s)
+    respiration = 0.055 * np.sin(2.0 * np.pi * 0.08 * time_axis_s + 0.7)
+    powerline = 0.025 * np.sin(2.0 * np.pi * config.powerline_hz * time_axis_s)
+    muscle_noise = 0.018 * rng.normal(0.0, 1.0, sample_count)
+    sensor_noise = config.noise_level * rng.normal(0.0, 1.0, sample_count)
+
+    maternal_reference = (
+        maternal_ecg
+        + 0.04 * np.sin(2.0 * np.pi * 0.20 * time_axis_s + 0.2)
+        + 0.012 * rng.normal(0.0, 1.0, sample_count)
+    )
+    abdominal_ecg = (
+        1.05 * maternal_abdominal
+        + config.fetal_scale * fetal_ecg
+        + baseline
+        + respiration
+        + powerline
+        + muscle_noise
+        + sensor_noise
+    )
+
+    return {
+        "time_s": time_axis_s,
+        "maternal_reference": maternal_reference,
+        "abdominal_ecg": abdominal_ecg,
+        "true_fetal_ecg": config.fetal_scale * fetal_ecg,
+        "true_maternal_abdominal": 1.05 * maternal_abdominal,
+        "maternal_beats_s": maternal_beats_s,
+        "fetal_beats_s": fetal_beats_s,
+    }
+
+
+def load_recording_csv(path: Path, fallback_sample_rate_hz: float) -> dict[str, np.ndarray]:
+    """Load an external CSV with abdominal_ecg and maternal_reference columns."""
+    with path.open("r", encoding="utf-8", newline="") as file:
+        reader = csv.DictReader(file)
+        rows = list(reader)
+
+    if not rows:
+        raise ValueError(f"{path} is empty")
+
+    required = {"abdominal_ecg", "maternal_reference"}
+    available = set(rows[0].keys())
+    missing = required - available
+    if missing:
+        raise ValueError(f"{path} is missing required columns: {', '.join(sorted(missing))}")
+
+    abdominal = np.array([float(row["abdominal_ecg"]) for row in rows], dtype=np.float64)
+    maternal_reference = np.array([float(row["maternal_reference"]) for row in rows], dtype=np.float64)
+
+    if "time_s" in available:
+        time_axis_s = np.array([float(row["time_s"]) for row in rows], dtype=np.float64)
+    else:
+        time_axis_s = np.arange(len(abdominal), dtype=np.float64) / fallback_sample_rate_hz
+
+    result = {
+        "time_s": time_axis_s,
+        "abdominal_ecg": abdominal,
+        "maternal_reference": maternal_reference,
+    }
+
+    if "true_fetal_ecg" in available:
+        result["true_fetal_ecg"] = np.array([float(row["true_fetal_ecg"]) for row in rows], dtype=np.float64)
+
+    return result
+
+
+def sample_rate_from_time(time_axis_s: np.ndarray, fallback_sample_rate_hz: float) -> float:
+    if len(time_axis_s) < 2:
+        return fallback_sample_rate_hz
+
+    step_s = float(np.median(np.diff(time_axis_s)))
+    if step_s <= 0:
+        return fallback_sample_rate_hz
+    return 1.0 / step_s
+
+
+def remove_dc(signal: np.ndarray) -> np.ndarray:
+    return signal - np.mean(signal)
+
+
+def normalized_lms_cancel(
+    reference: np.ndarray,
+    target: np.ndarray,
+    taps: int,
+    mu: float,
+    leakage: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Use normalized LMS to predict and subtract maternal ECG from the target.
+
+    Returns the residual fetal estimate, the estimated maternal component, and
+    the final adaptive filter weights.
+    """
+    reference = remove_dc(reference)
+    target = remove_dc(target)
+    weights = np.zeros(taps, dtype=np.float64)
+    buffer = np.zeros(taps, dtype=np.float64)
+    estimated_maternal = np.zeros_like(target)
+    residual = np.zeros_like(target)
+    eps = 1e-8
+
+    for index, sample in enumerate(reference):
+        buffer[1:] = buffer[:-1]
+        buffer[0] = sample
+
+        prediction = float(np.dot(weights, buffer))
+        error = target[index] - prediction
+        norm = float(np.dot(buffer, buffer) + eps)
+
+        weights = (1.0 - leakage) * weights + (mu / norm) * error * buffer
+        estimated_maternal[index] = prediction
+        residual[index] = error
+
+    return residual, estimated_maternal, weights
+
+
+def fft_bandpass(
+    signal: np.ndarray,
+    sample_rate_hz: float,
+    low_hz: float,
+    high_hz: float,
+    notch_hz: float,
+) -> np.ndarray:
+    """Apply a simple frequency-domain bandpass and powerline notch."""
+    signal = remove_dc(signal)
+    n = len(signal)
+    freqs = np.fft.rfftfreq(n, d=1.0 / sample_rate_hz)
+    spectrum = np.fft.rfft(signal)
+
+    mask = (freqs >= low_hz) & (freqs <= high_hz)
+    if notch_hz > 0:
+        mask &= np.abs(freqs - notch_hz) > 1.0
+        mask &= np.abs(freqs - 2.0 * notch_hz) > 1.0
+
+    filtered = np.fft.irfft(spectrum * mask, n=n)
+    return filtered.astype(np.float64)
+
+
+def moving_average(signal: np.ndarray, window_samples: int) -> np.ndarray:
+    window_samples = max(1, int(window_samples))
+    kernel = np.ones(window_samples, dtype=np.float64) / window_samples
+    return np.convolve(signal, kernel, mode="same")
+
+
+def qrs_energy_envelope(signal: np.ndarray, sample_rate_hz: float, window_ms: float) -> np.ndarray:
+    derivative = np.diff(signal, prepend=signal[0])
+    squared = derivative**2
+    window_samples = int(round((window_ms / 1000.0) * sample_rate_hz))
+    energy = moving_average(squared, window_samples)
+    energy /= np.max(energy) + 1e-12
+    return energy
+
+
+def detect_fetal_peaks(
+    energy: np.ndarray,
+    sample_rate_hz: float,
+    min_bpm: float,
+    max_bpm: float,
+) -> np.ndarray:
+    """Detect fetal QRS candidates from the enhanced residual energy."""
+    min_distance_samples = int(round(sample_rate_hz * 60.0 / max_bpm))
+    max_distance_samples = int(round(sample_rate_hz * 60.0 / min_bpm))
+    threshold = max(float(np.percentile(energy, 88.0)) * 0.38, float(np.median(energy) + 0.85 * np.std(energy)))
+
+    candidates: list[int] = []
+    for index in range(1, len(energy) - 1):
+        if energy[index] > threshold and energy[index] >= energy[index - 1] and energy[index] >= energy[index + 1]:
+            candidates.append(index)
+
+    if not candidates:
+        return np.array([], dtype=np.int64)
+
+    selected: list[int] = []
+    for candidate in candidates:
+        if not selected:
+            selected.append(candidate)
+            continue
+
+        distance = candidate - selected[-1]
+        if distance < min_distance_samples:
+            if energy[candidate] > energy[selected[-1]]:
+                selected[-1] = candidate
+        elif distance <= max_distance_samples or energy[candidate] > threshold * 1.15:
+            selected.append(candidate)
+
+    edge_guard = int(round(0.40 * sample_rate_hz))
+    selected = [peak for peak in selected if edge_guard <= peak < len(energy) - edge_guard]
+    return np.array(selected, dtype=np.int64)
+
+
+def detect_maternal_reference_peaks(reference: np.ndarray, sample_rate_hz: float, notch_hz: float) -> np.ndarray:
+    """Detect maternal R-peaks in the reference channel."""
+    filtered = fft_bandpass(reference, sample_rate_hz, low_hz=5.0, high_hz=38.0, notch_hz=notch_hz)
+    energy = qrs_energy_envelope(filtered, sample_rate_hz, window_ms=95.0)
+    min_distance_samples = int(round(sample_rate_hz * 60.0 / 125.0))
+    threshold = max(float(np.percentile(energy, 90.0)) * 0.45, float(np.median(energy) + 0.90 * np.std(energy)))
+
+    selected: list[int] = []
+    for index in range(1, len(energy) - 1):
+        if energy[index] <= threshold or energy[index] < energy[index - 1] or energy[index] < energy[index + 1]:
+            continue
+
+        if not selected:
+            selected.append(index)
+            continue
+
+        if index - selected[-1] < min_distance_samples:
+            if energy[index] > energy[selected[-1]]:
+                selected[-1] = index
+        else:
+            selected.append(index)
+
+    edge_guard = int(round(0.35 * sample_rate_hz))
+    selected = [peak for peak in selected if edge_guard <= peak < len(energy) - edge_guard]
+    return np.array(selected, dtype=np.int64)
+
+
+def suppress_maternal_qrs_windows(
+    signal: np.ndarray,
+    maternal_peaks: np.ndarray,
+    sample_rate_hz: float,
+    pre_ms: float = 85.0,
+    post_ms: float = 135.0,
+) -> np.ndarray:
+    """Reduce residual maternal QRS bursts by interpolating around reference peaks."""
+    suppressed = signal.copy()
+    pre_samples = int(round((pre_ms / 1000.0) * sample_rate_hz))
+    post_samples = int(round((post_ms / 1000.0) * sample_rate_hz))
+
+    for peak in maternal_peaks:
+        start = max(1, peak - pre_samples)
+        end = min(len(suppressed) - 1, peak + post_samples)
+        if end <= start + 2:
+            continue
+
+        bridge = np.linspace(suppressed[start - 1], suppressed[end], end - start)
+        suppressed[start:end] = 0.18 * suppressed[start:end] + 0.82 * bridge
+
+    return suppressed
+
+
+def estimate_heart_rate_bpm(peaks: np.ndarray, sample_rate_hz: float) -> float | None:
+    if len(peaks) < 2:
+        return None
+
+    rr_intervals_s = np.diff(peaks) / sample_rate_hz
+    rr_intervals_s = rr_intervals_s[(rr_intervals_s > 0.20) & (rr_intervals_s < 0.90)]
+    if len(rr_intervals_s) == 0:
+        return None
+
+    return float(60.0 / np.median(rr_intervals_s))
+
+
+def rms(signal: np.ndarray) -> float:
+    return float(np.sqrt(np.mean(signal**2)))
+
+
+def projection_rms(signal: np.ndarray, reference: np.ndarray) -> float:
+    reference = remove_dc(reference)
+    signal = remove_dc(signal)
+    scale = float(np.dot(signal, reference) / (np.dot(reference, reference) + 1e-12))
+    return rms(scale * reference)
+
+
+def correlation(a: np.ndarray, b: np.ndarray) -> float:
+    a = remove_dc(a)
+    b = remove_dc(b)
+    return float(np.dot(a, b) / ((np.linalg.norm(a) * np.linalg.norm(b)) + 1e-12))
+
+
+def match_peak_metrics(
+    predicted_peaks: np.ndarray,
+    true_beat_times_s: np.ndarray,
+    sample_rate_hz: float,
+    tolerance_ms: float = 90.0,
+) -> tuple[float | None, float | None]:
+    if len(predicted_peaks) == 0 or len(true_beat_times_s) == 0:
+        return None, None
+
+    tolerance_samples = int(round((tolerance_ms / 1000.0) * sample_rate_hz))
+    true_peaks = np.round(true_beat_times_s * sample_rate_hz).astype(np.int64)
+    matched_true: set[int] = set()
+    matched_pred = 0
+
+    for predicted in predicted_peaks:
+        distances = np.abs(true_peaks - predicted)
+        nearest = int(np.argmin(distances))
+        if distances[nearest] <= tolerance_samples and nearest not in matched_true:
+            matched_true.add(nearest)
+            matched_pred += 1
+
+    precision = matched_pred / len(predicted_peaks)
+    recall = len(matched_true) / len(true_peaks)
+    return float(precision), float(recall)
+
+
+def normalize_for_output(signal: np.ndarray) -> np.ndarray:
+    centered = remove_dc(signal)
+    peak = float(np.percentile(np.abs(centered), 99.0) + 1e-12)
+    return np.clip(centered / peak, -1.0, 1.0)
+
+
+def write_output_csv(
+    path: Path,
+    time_s: np.ndarray,
+    abdominal_ecg: np.ndarray,
+    maternal_reference: np.ndarray,
+    estimated_maternal: np.ndarray,
+    qrs_suppressed_residual: np.ndarray,
+    extracted_fetal: np.ndarray,
+    qrs_energy: np.ndarray,
+    true_fetal: np.ndarray | None,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    columns = [
+        "time_s",
+        "abdominal_ecg",
+        "maternal_reference",
+        "estimated_maternal_ecg",
+        "qrs_suppressed_residual",
+        "extracted_fetal_ecg",
+        "qrs_energy",
+    ]
+    arrays = [time_s, abdominal_ecg, maternal_reference, estimated_maternal, qrs_suppressed_residual, extracted_fetal, qrs_energy]
+
+    if true_fetal is not None:
+        columns.append("true_fetal_ecg")
+        arrays.append(true_fetal)
+
+    data = np.column_stack(arrays)
+    np.savetxt(path, data, delimiter=",", header=",".join(columns), comments="", fmt="%.8f")
+
+
+def png_chunk(chunk_type: bytes, data: bytes) -> bytes:
+    checksum = zlib.crc32(chunk_type + data) & 0xFFFFFFFF
+    return struct.pack(">I", len(data)) + chunk_type + data + struct.pack(">I", checksum)
+
+
+def write_rgb_png(path: Path, image: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    height, width, _ = image.shape
+    raw = b"".join(b"\x00" + np.ascontiguousarray(row).tobytes() for row in image)
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+
+    with path.open("wb") as file:
+        file.write(b"\x89PNG\r\n\x1a\n")
+        file.write(png_chunk(b"IHDR", ihdr))
+        file.write(png_chunk(b"IDAT", zlib.compress(raw, level=9)))
+        file.write(png_chunk(b"IEND", b""))
+
+
+def draw_line(image: np.ndarray, x0: int, y0: int, x1: int, y1: int, color: tuple[int, int, int]) -> None:
+    dx = abs(x1 - x0)
+    dy = -abs(y1 - y0)
+    sx = 1 if x0 < x1 else -1
+    sy = 1 if y0 < y1 else -1
+    error = dx + dy
+    x, y = x0, y0
+
+    while True:
+        if 0 <= y < image.shape[0] and 0 <= x < image.shape[1]:
+            image[max(0, y - 1) : min(image.shape[0], y + 2), max(0, x - 1) : min(image.shape[1], x + 2)] = color
+
+        if x == x1 and y == y1:
+            break
+
+        doubled_error = 2 * error
+        if doubled_error >= dy:
+            error += dy
+            x += sx
+        if doubled_error <= dx:
+            error += dx
+            y += sy
+
+
+def draw_signal_panel(
+    image: np.ndarray,
+    signal: np.ndarray,
+    panel_index: int,
+    panel_count: int,
+    color: tuple[int, int, int],
+) -> None:
+    height, width, _ = image.shape
+    panel_height = height // panel_count
+    top = panel_index * panel_height
+    bottom = height if panel_index == panel_count - 1 else (panel_index + 1) * panel_height
+    mid_y = (top + bottom) // 2
+
+    image[top : top + 2, :] = (205, 214, 218)
+    image[mid_y : mid_y + 1, :] = (226, 232, 235)
+    for grid_x in np.linspace(0, width - 1, 9).astype(int):
+        image[top:bottom, grid_x : grid_x + 1] = (238, 242, 244)
+
+    robust_peak = float(np.percentile(np.abs(remove_dc(signal)), 98.0) + 1e-12)
+    normalized = np.clip(remove_dc(signal) / robust_peak, -1.0, 1.0)
+    x_coords = np.linspace(0, width - 1, len(normalized)).astype(int)
+    y_coords = (mid_y - normalized * (panel_height * 0.36)).astype(int)
+
+    for index in range(1, len(normalized)):
+        draw_line(
+            image,
+            int(x_coords[index - 1]),
+            int(y_coords[index - 1]),
+            int(x_coords[index]),
+            int(y_coords[index]),
+            color,
+        )
+
+
+def write_preview_png(
+    path: Path,
+    time_s: np.ndarray,
+    abdominal_ecg: np.ndarray,
+    maternal_reference: np.ndarray,
+    extracted_fetal: np.ndarray,
+    qrs_energy: np.ndarray,
+    preview_duration_s: float = 8.0,
+) -> None:
+    sample_rate_hz = sample_rate_from_time(time_s, fallback_sample_rate_hz=500.0)
+    preview_samples = min(len(time_s), int(round(preview_duration_s * sample_rate_hz)))
+    image = np.full((900, 1400, 3), 255, dtype=np.uint8)
+
+    panels = [
+        (abdominal_ecg[:preview_samples], (38, 70, 120)),
+        (maternal_reference[:preview_samples], (92, 100, 108)),
+        (extracted_fetal[:preview_samples], (18, 128, 110)),
+        (qrs_energy[:preview_samples], (190, 72, 66)),
+    ]
+
+    for panel_index, (signal, color) in enumerate(panels):
+        draw_signal_panel(image, signal, panel_index, len(panels), color)
+
+    write_rgb_png(path, image)
+
+
+def write_summary(
+    path: Path,
+    sample_rate_hz: float,
+    duration_s: float,
+    config: ExtractionConfig,
+    output_csv: Path,
+    preview_png: Path,
+    maternal_peaks: np.ndarray,
+    predicted_peaks: np.ndarray,
+    estimated_fetal_hr: float | None,
+    maternal_suppression_db: float,
+    fetal_correlation: float | None,
+    peak_precision: float | None,
+    peak_recall: float | None,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "Fetal ECG Extraction Engine",
+        "",
+        "Pipeline:",
+        "1. Load or simulate an abdominal ECG mixture.",
+        "2. Use a maternal ECG reference channel as the adaptive noise reference.",
+        "3. Run normalized LMS filtering to predict the maternal component.",
+        "4. Subtract the predicted maternal ECG from the abdominal recording.",
+        "5. Suppress residual maternal QRS windows using reference-channel peaks.",
+        "6. Enhance the residual with FFT bandpass filtering.",
+        "7. Detect fetal QRS energy and estimate fetal heart rate.",
+        "",
+        "Configuration:",
+        f"- Sample rate: {sample_rate_hz:.1f} Hz",
+        f"- Duration: {duration_s:.2f} s",
+        f"- LMS taps: {config.lms_taps}",
+        f"- LMS step size: {config.lms_mu:.4f}",
+        f"- Fetal enhancement band: {config.fetal_band_low_hz:.1f}-{config.fetal_band_high_hz:.1f} Hz",
+        "",
+        "Results:",
+        f"- Detected maternal reference peaks: {len(maternal_peaks)}",
+        f"- Detected fetal QRS peaks: {len(predicted_peaks)}",
+        f"- Estimated fetal heart rate: {estimated_fetal_hr:.1f} BPM" if estimated_fetal_hr is not None else "- Estimated fetal heart rate: unavailable",
+        f"- Maternal component suppression: {maternal_suppression_db:.2f} dB",
+    ]
+
+    if fetal_correlation is not None:
+        lines.append(f"- Extracted-vs-true fetal correlation: {fetal_correlation:.3f}")
+    if peak_precision is not None and peak_recall is not None:
+        lines.append(f"- Fetal QRS detection precision: {peak_precision:.3f}")
+        lines.append(f"- Fetal QRS detection recall: {peak_recall:.3f}")
+
+    lines.extend(
+        [
+            "",
+            "Outputs:",
+            f"- Signal CSV: {output_csv}",
+            f"- Preview PNG: {preview_png}",
+            "",
+            "Important note:",
+            "This is a DSP and biomedical engineering prototype for portfolio use.",
+            "It is not a diagnostic fetal monitor or certified medical device.",
+        ]
+    )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Extract fetal ECG from abdominal ECG using adaptive maternal cancellation.")
+    parser.add_argument("--input-csv", type=Path, default=None, help="Optional CSV with abdominal_ecg and maternal_reference columns.")
+    parser.add_argument("--output-dir", type=Path, default=Path("outputs"), help="Directory for exported files.")
+    parser.add_argument("--sample-rate-hz", type=float, default=500.0, help="Sample rate for simulation or CSV without time_s.")
+    parser.add_argument("--duration-s", type=float, default=25.0, help="Synthetic recording duration in seconds.")
+    parser.add_argument("--maternal-hr-bpm", type=float, default=78.0, help="Synthetic maternal heart rate.")
+    parser.add_argument("--fetal-hr-bpm", type=float, default=148.0, help="Synthetic fetal heart rate.")
+    parser.add_argument("--fetal-scale", type=float, default=0.22, help="Synthetic fetal ECG amplitude inside abdominal mixture.")
+    parser.add_argument("--noise-level", type=float, default=0.035, help="Synthetic sensor noise level.")
+    parser.add_argument("--powerline-hz", type=float, default=60.0, help="Powerline frequency to notch in Hz.")
+    parser.add_argument("--seed", type=int, default=7, help="Random seed for synthetic data.")
+    parser.add_argument("--lms-taps", type=int, default=36, help="Adaptive filter tap count.")
+    parser.add_argument("--lms-mu", type=float, default=0.085, help="Normalized LMS step size.")
+    parser.add_argument("--band-low-hz", type=float, default=5.0, help="Fetal ECG enhancement band low cutoff.")
+    parser.add_argument("--band-high-hz", type=float, default=65.0, help="Fetal ECG enhancement band high cutoff.")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    output_dir = args.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    extraction_config = ExtractionConfig(
+        lms_taps=args.lms_taps,
+        lms_mu=args.lms_mu,
+        fetal_band_low_hz=args.band_low_hz,
+        fetal_band_high_hz=args.band_high_hz,
+    )
+
+    if args.input_csv is not None:
+        recording = load_recording_csv(args.input_csv, fallback_sample_rate_hz=args.sample_rate_hz)
+    else:
+        simulation_config = SimulationConfig(
+            sample_rate_hz=args.sample_rate_hz,
+            duration_s=args.duration_s,
+            maternal_hr_bpm=args.maternal_hr_bpm,
+            fetal_hr_bpm=args.fetal_hr_bpm,
+            fetal_scale=args.fetal_scale,
+            noise_level=args.noise_level,
+            powerline_hz=args.powerline_hz,
+            seed=args.seed,
+        )
+        recording = simulate_abdominal_recording(simulation_config)
+
+    time_s = recording["time_s"]
+    abdominal_ecg = recording["abdominal_ecg"]
+    maternal_reference = recording["maternal_reference"]
+    true_fetal = recording.get("true_fetal_ecg")
+    true_maternal = recording.get("true_maternal_abdominal")
+    true_fetal_beats_s = recording.get("fetal_beats_s")
+    sample_rate_hz = sample_rate_from_time(time_s, fallback_sample_rate_hz=args.sample_rate_hz)
+
+    residual, estimated_maternal, _ = normalized_lms_cancel(
+        reference=maternal_reference,
+        target=abdominal_ecg,
+        taps=extraction_config.lms_taps,
+        mu=extraction_config.lms_mu,
+        leakage=extraction_config.lms_leakage,
+    )
+    maternal_peaks = detect_maternal_reference_peaks(maternal_reference, sample_rate_hz, notch_hz=args.powerline_hz)
+    qrs_suppressed_residual = suppress_maternal_qrs_windows(residual, maternal_peaks, sample_rate_hz)
+    extracted_fetal = fft_bandpass(
+        qrs_suppressed_residual,
+        sample_rate_hz=sample_rate_hz,
+        low_hz=extraction_config.fetal_band_low_hz,
+        high_hz=extraction_config.fetal_band_high_hz,
+        notch_hz=args.powerline_hz,
+    )
+    qrs_energy = qrs_energy_envelope(extracted_fetal, sample_rate_hz, extraction_config.qrs_window_ms)
+    predicted_peaks = detect_fetal_peaks(
+        qrs_energy,
+        sample_rate_hz=sample_rate_hz,
+        min_bpm=extraction_config.fetal_min_bpm,
+        max_bpm=extraction_config.fetal_max_bpm,
+    )
+    estimated_fetal_hr = estimate_heart_rate_bpm(predicted_peaks, sample_rate_hz)
+
+    if true_maternal is not None:
+        before_maternal_projection = projection_rms(abdominal_ecg, true_maternal)
+        after_maternal_projection = projection_rms(extracted_fetal, true_maternal)
+    else:
+        before_maternal_projection = projection_rms(abdominal_ecg, maternal_reference)
+        after_maternal_projection = projection_rms(extracted_fetal, maternal_reference)
+    maternal_suppression_db = 20.0 * np.log10((before_maternal_projection + 1e-12) / (after_maternal_projection + 1e-12))
+
+    fetal_correlation = correlation(extracted_fetal, true_fetal) if true_fetal is not None else None
+    if true_fetal_beats_s is not None:
+        peak_precision, peak_recall = match_peak_metrics(predicted_peaks, true_fetal_beats_s, sample_rate_hz)
+    else:
+        peak_precision, peak_recall = None, None
+
+    output_csv = output_dir / "fetal_ecg_extraction.csv"
+    preview_png = output_dir / "fetal_ecg_extraction_preview.png"
+    summary_txt = output_dir / "extraction_summary.txt"
+
+    write_output_csv(
+        output_csv,
+        time_s=time_s,
+        abdominal_ecg=abdominal_ecg,
+        maternal_reference=maternal_reference,
+        estimated_maternal=estimated_maternal,
+        qrs_suppressed_residual=qrs_suppressed_residual,
+        extracted_fetal=extracted_fetal,
+        qrs_energy=qrs_energy,
+        true_fetal=true_fetal,
+    )
+    write_preview_png(
+        preview_png,
+        time_s=time_s,
+        abdominal_ecg=normalize_for_output(abdominal_ecg),
+        maternal_reference=normalize_for_output(maternal_reference),
+        extracted_fetal=normalize_for_output(extracted_fetal),
+        qrs_energy=qrs_energy,
+    )
+    write_summary(
+        summary_txt,
+        sample_rate_hz=sample_rate_hz,
+        duration_s=float(time_s[-1] - time_s[0]) if len(time_s) else 0.0,
+        config=extraction_config,
+        output_csv=output_csv,
+        preview_png=preview_png,
+        maternal_peaks=maternal_peaks,
+        predicted_peaks=predicted_peaks,
+        estimated_fetal_hr=estimated_fetal_hr,
+        maternal_suppression_db=float(maternal_suppression_db),
+        fetal_correlation=fetal_correlation,
+        peak_precision=peak_precision,
+        peak_recall=peak_recall,
+    )
+
+    print("Fetal ECG extraction complete.")
+    print(f"CSV:     {output_csv}")
+    print(f"Preview: {preview_png}")
+    print(f"Summary: {summary_txt}")
+    if estimated_fetal_hr is not None:
+        print(f"Estimated fetal HR: {estimated_fetal_hr:.1f} BPM")
+    print(f"Maternal suppression: {maternal_suppression_db:.2f} dB")
+
+
+if __name__ == "__main__":
+    main()
